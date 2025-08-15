@@ -1,0 +1,13 @@
+{
+    "id": "cookbook:Cabbage Kimchi",
+    "title": "Cabbage Kimchi",
+    "source_url": "https://en.wikibooks.org/wiki/Cookbook:Cabbage_Kimchi",
+    "cuisine": null,
+    "tags": ["Wikibooks", "Recipe"],
+    "ingredients": ["Napa cabbage ...", "Salt ...", "Gochugaru ..."],
+    "steps": ["Quarter the cabbage ...", "Rinse and salt ...", "Pack into jar ..."],
+    "servings": null,
+    "total_time_min": null,
+    "license": "CC BY-SA 3.0",
+    "raw_wikitext": "== Ingredients ==\n* ...\n== Procedure ==\n# ...\n"
+  }
