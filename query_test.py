@@ -7,7 +7,7 @@ load_dotenv()
 
 client = QdrantClient(url=os.getenv("QDRANT_URL"), api_key=os.getenv("QDRANT_API_KEY"))
 model = SentenceTransformer(os.getenv("EMBED_MODEL", "BAAI/bge-m3"))
-qvec = model.encode(["fried rice"], normalize_embeddings=True).astype("float32")[0].tolist()
+qvec = model.encode(["Chicken Gyros"], normalize_embeddings=True).astype("float32")[0].tolist()
 
 hits = client.search(collection_name=os.getenv("QDRANT_COLLECTION","recipes"),
                      query_vector=qvec, limit=5, with_payload=True)
