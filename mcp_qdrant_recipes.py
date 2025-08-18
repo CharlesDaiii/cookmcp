@@ -1,7 +1,7 @@
 from __future__ import annotations
 from typing import Optional, Literal, List
 from typing_extensions import TypedDict
-import os, uuid, json, logging
+import os, uuid, json, logging, re
 from dataclasses import dataclass
 
 from mcp.server.fastmcp import FastMCP
@@ -135,6 +135,87 @@ def rough_nutrition(ings: List[Ingredient], servings: int) -> Nutrition:
         "sodium_mg": int(600 / max(1, servings)),
     }
 
+# ---- Pantry matching helpers (canonicalization + coverage) ----
+BASIC_PANTRY = {
+    "salt", "sugar", "oil", "water", "pepper", "black pepper", "white pepper"
+}
+
+SYNONYMS = {
+    "spring onion": "green onion",
+    "scallion": "green onion",
+    "coriander": "cilantro",
+    "bell pepper": "capsicum",
+    "chilli": "chili",
+    "birds eye chili": "chili",
+    "garbanzo bean": "chickpea",
+    "garbanzo": "chickpea",
+    "minced beef": "ground beef",
+    "corn starch": "cornstarch",
+    "light soy sauce": "soy sauce",
+    "dark soy sauce": "soy sauce",
+}
+
+def canonical_ingredient(s: str) -> str:
+    """Normalize an ingredient phrase to a rough canonical key.
+    - lowercase
+    - drop parentheses, digits/units, and common descriptors
+    - apply simple synonyms mapping
+    Returns a short phrase suitable for set comparison.
+    """
+    s = s.lower()
+    s = re.sub(r"\(.*?\)", " ", s)
+    s = re.sub(r"[^a-z\s]", " ", s)  # keep letters/spaces only
+    tokens = [t for t in s.split() if t not in {
+        "fresh","dried","chopped","minced","sliced","diced","crushed",
+        "to","taste","of","and","or","optional","large","small","medium",
+        "teaspoon","tsp","tablespoon","tbsp","cup","cups","gram","grams","g","kg",
+        "ml","l","ounce","ounces","oz","lb","pound","clove","cloves","slice","slices","piece","pieces"
+    }]
+    s = " ".join(tokens).strip()
+    # apply synonyms when present as substrings
+    for k, v in SYNONYMS.items():
+        if k in s:
+            s = s.replace(k, v)
+    return s.strip()
+
+def ingredient_keys_from_list(items: List[str]) -> set:
+    keys = set()
+    for x in items or []:
+        k = canonical_ingredient(str(x))
+        if not k:
+            continue
+        # Add both the phrase and its last token (e.g., "green onion" -> "green onion", "onion")
+        keys.add(k)
+        parts = k.split()
+        if parts:
+            keys.add(parts[-1])
+    # remove trivial basics from recipe key set
+    return {k for k in keys if k not in BASIC_PANTRY}
+
+def compute_coverage(recipe_ingredients: List[str], pantry_keys: set, avoid: List[str]) -> tuple[float, set, set, set]:
+    """Return (coverage, matched, missing, recipe_keys).
+    coverage = matched / len(recipe_keys). Avoided ingredients will cause a 0 coverage.
+    """
+    recipe_keys = ingredient_keys_from_list(recipe_ingredients)
+    if not recipe_keys:
+        return 0.0, set(), set(), set()
+
+    # If any avoid item appears in recipe, return zero-coverage (we'll filter later)
+    for a in avoid or []:
+        akey = canonical_ingredient(a)
+        if any(akey and (akey == rk or akey in rk or rk in akey) for rk in recipe_keys):
+            return 0.0, set(), recipe_keys, recipe_keys
+
+    matched = set()
+    for rk in recipe_keys:
+        for pk in pantry_keys:
+            if rk == pk or rk in pk or pk in rk:
+                matched.add(rk)
+                break
+    missing = recipe_keys - matched
+    cov = len(matched) / max(1, len(recipe_keys))
+    return cov, matched, missing, recipe_keys
+
 # ---------------- MCP Tools ----------------
 
 @mcp.tool()
@@ -193,6 +274,82 @@ def search_recipes(
             "tags": p.get("tags", []),
         })
     return out
+
+@mcp.tool()
+def recommend_recipes_by_pantry(
+    pantry: List[str],
+    top_k: int = 5,
+    k_candidates: int = 50,
+    min_coverage: float = 0.4,
+    cuisine: Optional[str] = None,
+    tags: List[str] = [],
+    avoid: List[str] = [],
+    alpha: float = 0.5,
+) -> List[dict]:
+    """
+    Recommend top_k recipes you can cook with what's in your pantry.
+    Ranking = alpha * semantic_similarity + (1-alpha) * ingredient_coverage.
+    - pantry: available ingredients (free text)
+    - k_candidates: how many nearest neighbors to consider before re-ranking
+    - min_coverage: minimum ingredient coverage to keep a hit (0-1)
+    - cuisine/tags: optional exact-match filters on payload fields
+    - avoid: ingredients to exclude (allergy/ban list)
+    - alpha: blend weight between similarity and coverage
+    Returns: list of items with fields: id, title, source_url, score, similarity, coverage,
+             matched, missing, cuisine, tags
+    """
+    client = ensure_collection()
+
+    # Build semantic query and filter
+    query_text = build_query_text(pantry, cuisine, [], None)
+    qvec = EMB.encode([query_text])[0].tolist()
+
+    qfilter: Optional[Filter] = None
+    must = []
+    if cuisine:
+        must.append(FieldCondition(key="cuisine", match=MatchValue(value=cuisine)))
+    for t in tags or []:
+        must.append(FieldCondition(key="tags", match=MatchValue(value=t)))
+    if must:
+        qfilter = Filter(must=must)
+
+    hits = client.search(
+        collection_name=COLLECTION,
+        query_vector=qvec,
+        limit=k_candidates,
+        with_payload=True,
+        query_filter=qfilter,
+    )
+
+    # Prepare pantry keys once
+    pantry_keys = ingredient_keys_from_list(pantry)
+
+    ranked = []
+    for h in hits:
+        p = h.payload or {}
+        r_ings = p.get("ingredients") or []
+        cov, matched, missing, rkeys = compute_coverage(r_ings, pantry_keys, avoid)
+        if cov < min_coverage:
+            continue
+        # Qdrant returns similarity; normalize to 0..1 (cosine in [-1,1])
+        sim = float(h.score)
+        sim01 = max(0.0, min(1.0, (sim + 1.0) / 2.0))
+        combo = alpha * sim01 + (1 - alpha) * cov
+        ranked.append({
+            "id": str(h.id),
+            "title": p.get("title"),
+            "source_url": p.get("source_url"),
+            "cuisine": p.get("cuisine"),
+            "tags": p.get("tags", []),
+            "score": round(combo, 4),
+            "similarity": round(sim01, 4),
+            "coverage": round(cov, 4),
+            "matched": sorted(matched),
+            "missing": sorted(missing),
+        })
+
+    ranked.sort(key=lambda x: (x["score"], x["coverage"], x["similarity"]), reverse=True)
+    return ranked[:top_k]
 
 @mcp.tool()
 def generate_recipe(
